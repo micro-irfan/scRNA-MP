@@ -1,0 +1,140 @@
+import os
+from glob import glob
+import pandas as pd
+
+# snakemake -s ../workflows/generate_pileup.snakemake -j 8 --scheduler greedy -p --use-singularity --rerun-incomplete --configfile ../workflows/generate_pileup.config
+
+REFERENCE = config["reference"]
+DIRECTORY = config["output_path"]
+SAMPLESHEET = config["sample_sheet"]
+PATH_TO_IMAGE = config["image_path"]
+
+SAMPLES = pd.read_csv(SAMPLESHEET)["sample_id"].tolist()
+
+# ============================================================================
+# SINGULARITY + SCRIPTS PATH
+# ============================================================================ 
+
+IMAGE = PATH_TO_IMAGE + "/bowtie2_samtools_py312.sif"
+
+def get_bc_ids(sample):
+    barcode_files = glob(DIRECTORY + f"/{sample}/pileup/tmp/{sample}/barcodes/{sample}.barcode.*")
+
+    bc_ids = []
+    for bf in barcode_files:
+        with open(bf) as f:
+            for line in f:
+                bc_id = line.strip().split(",")[0]
+                bc_ids.append(bc_id)
+    
+    return bc_ids
+
+
+input_files = []
+for sample in SAMPLES:
+    input_files.extend(
+        expand(
+            DIRECTORY + "/{sample}/pileup/{sample}/{sample}.{bc}.pileup",
+            sample=[sample],
+            bc=get_bc_ids(sample)
+        )
+    )
+
+
+rule all:
+    input:
+        expand(DIRECTORY + "/{sample}/pileup/{sample}/.complete", sample=SAMPLES)
+
+
+checkpoint add_readgroup:
+    input:
+        bam=lambda wc: f"{DIRECTORY}/{wc.sample}/mapping/{wc.sample}_filter40_dedup.bam",
+        barcode_file=lambda wc: f"{DIRECTORY}/{wc.sample}/mapping/{wc.sample}_filter40_barcode.txt",
+    output:
+        bam=temp(DIRECTORY + "/{sample}/pileup/tmp/{sample}/{sample}.addRG.bam"),
+        barcode_dir=directory(DIRECTORY + "/{sample}/pileup/tmp/{sample}/barcodes"),
+        read_count=DIRECTORY + "/{sample}/pileup/tmp/{sample}/{sample}.cell_clusters.read_count.csv"
+
+    params: 
+        folder = DIRECTORY + f"/{{sample}}/pileup/tmp"
+    
+    singularity: IMAGE
+
+    shell:
+        r"""
+        mkdir -p {params.folder}/{wildcards.sample}/barcodes
+
+        python3 ../bin/add_readgroup.py \
+            -s {wildcards.sample} \
+            --bam {input.bam} \
+            --barcode {input.barcode_file} \
+            -o {params.folder}/{wildcards.sample}/{wildcards.sample}.addRG.bam \
+            --chunk_size 100
+
+        mv {wildcards.sample}.barcode.* {params.folder}/{wildcards.sample}/barcodes/ 2>/dev/null || true
+        mv {wildcards.sample}.cell_clusters.read_count.csv {output.read_count} 2>/dev/null || true
+        """
+
+
+def get_pileups(wildcards):
+    ckpt = checkpoints.add_readgroup.get(sample=wildcards.sample)
+    barcode_dir = ckpt.output.barcode_dir
+    files = glob(os.path.join(barcode_dir, "*.txt"))
+    ids = [os.path.basename(f).replace(".txt", "") for f in files]
+    return expand("results/{sample}/{barcode}.pileup",
+                  sample=wildcards.sample,
+                  barcode=ids)
+
+
+rule mpileup:
+    input:
+        bam=lambda wc: checkpoints.add_readgroup.get(sample=wc.sample).output.bam,
+        ref=REFERENCE + ".fa",
+        fai=REFERENCE + ".fa.fai"
+    output:
+        DIRECTORY + "/{sample}/pileup/{sample}/{sample}.{bc}.pileup"
+    log:
+        DIRECTORY + "/{sample}/logs/{sample}/{sample}.{bc}.log"
+    
+    params:
+        folder = DIRECTORY + "/{sample}/pileup"
+    
+    singularity: IMAGE
+
+    shell:
+        r"""
+        samtools view -h -r {wildcards.bc} {input.bam} | \
+        samtools mpileup -f {input.ref} - > {output} 2> {log}
+        """
+    
+def get_bc_ids_from_checkpoint(sample):
+    ckpt = checkpoints.add_readgroup.get(sample=sample)
+    barcode_file = ckpt.output.barcode_file
+
+    bc_ids = []
+    with open(barcode_file) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            bc_id = line.split(",")[0].strip()
+            if bc_id:
+                bc_ids.append(bc_id)
+
+    return bc_ids
+
+def get_sample_pileups(wildcards):
+    bc_ids = get_bc_ids_from_checkpoint(wildcards.sample)
+    return expand(
+        DIRECTORY + "/{sample}/pileup/{sample}/{sample}.{bc}.pileup",
+        sample=[wildcards.sample],
+        bc=bc_ids
+    )
+
+rule pileups_complete:
+    input:
+        get_sample_pileups
+    output:
+        DIRECTORY + "/{sample}/pileup/{sample}/.complete"
+    shell:
+        "touch {output}"

@@ -1,0 +1,6 @@
+reference: /scratch/users/astar/gis/muhdih/sgRNA_mutational_rate/cellline/ref/hg38_ncbi_selected_transcriptome.rmdup
+output_path: /scratch/users/astar/gis/muhdih/sgRNA_mutational_rate/cellline/results_3/fastp_filter
+sample_sheet: samplesheet.csv
+image_path: /scratch/users/astar/gis/muhdih/image
+python_image_path: /scratch/users/astar/gis/muhdih/image/bowtie2_samtools_py312.sif
+threads: 16

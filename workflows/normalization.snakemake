@@ -1,0 +1,278 @@
+import os
+import glob
+from pathlib import Path 
+import pandas as pd
+
+WORKDIR = config["output_path"]
+WORKER_THREADS = config["threads"]
+SAMPLESHEET = config["sample_sheet"]
+PYTHON_IMAGE = config["python_image_path"]
+REFERENCE = config["reference"]
+PATH_TO_SCRIPTS = workflow.basedir + "/../src"
+WINDOWS = [50, 100]
+
+SAMPLES = pd.read_csv(SAMPLESHEET)["sample_id"].tolist()
+
+DMSO_SAMPLES = [s for s in SAMPLES if ("DMSO" in s)]
+NAIN3_SAMPLES = [s for s in SAMPLES if ("NAIN3" in s)]
+
+CONDITIONS = ["NAIN3", "DMSO"]
+
+FILTER_READ_LENGTH = 40
+
+# ============================================================================
+# SINGULARITY + SCRIPTS PATH
+# ============================================================================ 
+
+
+MAKE_MATRICES = PATH_TO_SCRIPTS + "/create_windows.py"
+QC_CREATE_COUNT_MATRIX = PATH_TO_SCRIPTS + "/qc_create_count_matrix.py"
+QC_PLOT_COUNT = PATH_TO_SCRIPTS + "/qc_plot_counts.py"
+NORMALIZATION = PATH_TO_SCRIPTS + "/normalization.py"
+QC_CELL_DISTRIBUTION = PATH_TO_SCRIPTS + "/qc_cells_distribution.py"
+CREATE_FIXED_WINDOWS = PATH_TO_SCRIPTS + "/create_single_base_fixed_window.py"
+MAKE_FIXED_WINDOWS = PATH_TO_SCRIPTS + "/create_single_base_fixed_window.py"
+CALCULATE_PSEUDOBULK = PATH_TO_SCRIPTS + "/create_pseudobulk.py"
+
+GET_MUTRATE_SCRIPT = "get_mutrate.v4.1.py"
+CELLSNP_WINDOW_MUTRATE_SCRIPT = "cellSNP2window_v2.py"
+
+
+rule all:
+    input:
+        expand(
+            WORKDIR + "/post_mapping/plot_count/{condition}",
+            condition=CONDITIONS
+        ), 
+        expand(
+            WORKDIR + "/post_mapping/matrices/single_base/{sample}/{sample}.{type}.matrix10.AllCells.csv",
+            type=["coverage", "mutant", "mutrate"],
+            sample=SAMPLES
+        ), 
+        expand(
+            WORKDIR + "/post_mapping/matrices/bam_gene_count/{sample}.gene_count.mx",
+            sample=SAMPLES
+        ), 
+        expand(
+            WORKDIR + "/post_mapping/normalized_mtx/single_base/{sample}/{sample}.normalized_reactivity.matrix{window}.AllCells.gene_level.csv",
+            sample=NAIN3_SAMPLES,
+            window=WINDOWS
+        ),
+        expand(
+            WORKDIR + "/post_mapping/single_base_to_fixed_absolute/{sample}.{type}.matrix{coverage}.AllCells.csv",
+            sample=NAIN3_SAMPLES,
+            type=["coverage", "fixed_single_base"],
+            coverage=["50", "100"]
+        ),
+        expand(
+            WORKDIR + "/post_mapping/pseudobulk/.{sample}.done",
+            sample=DMSO_SAMPLES
+        )
+
+        
+
+def get_pileups(wc):
+    return sorted(glob.glob(WORKDIR + f"/pileup_results/pileup/{wc.sample}/{wc.sample}.bc*.pileup"))
+    
+
+def get_samples_by_condition(condition):
+    return [s for s in SAMPLES if condition in s]
+
+def get_matrices_by_condition(wc):
+    return expand(
+        WORKDIR + "/post_mapping/matrices/single_base/{sample}/{sample}.{kind}.matrix10.AllCells.csv",
+        sample=get_samples_by_condition(wc.condition),
+        kind=["coverage", "mutant", "mutrate"]
+    )
+
+def get_matrices_specific_condition(sample, condition="NAIN3"):
+    selected_samples = [s for s in SAMPLES if condition in s and s == sample]
+
+    return expand(
+        WORKDIR + "/post_mapping/matrices/single_base/{sample}/{sample}.{kind}.matrix10.AllCells.csv",
+        sample=selected_samples,
+        kind=["coverage", "mutant", "mutrate"]
+    )
+
+rule create_gene_matrix_bam:
+    input:
+        path_to_bam = WORKDIR + "/preprocessing/{sample}/mapping/{sample}_fastp_filter" + str(FILTER_READ_LENGTH) + "_addAlltag.bam",
+        path_to_barcode = WORKDIR + "/preprocessing/{sample}/mapping/{sample}_filter" + str(FILTER_READ_LENGTH) + "_barcode.txt",
+        ref = REFERENCE + ".fa",
+        fai = REFERENCE + ".fa.fai"
+    output:
+        WORKDIR + "/post_mapping/matrices/bam_gene_count/{sample}.gene_count.mx"
+    
+    params:
+        output_dir = WORKDIR + f"/post_mapping/matrices/bam_gene_count",
+    
+    singularity: 
+        PYTHON_IMAGE
+
+    shell:
+        r"""
+        python3 {QC_CREATE_COUNT_MATRIX} -s {wildcards.sample} \
+                                         -bc {input.path_to_barcode} \
+                                         -bam {input.path_to_bam} \
+                                         -r {input.ref} \
+                                         -o {params.output_dir}
+        """
+
+
+checkpoint create_single_base_matrix:
+    input:
+        path_to_pileup = get_pileups,
+        path_to_barcode = WORKDIR + "/preprocessing/{sample}/mapping/{sample}_filter" + str(FILTER_READ_LENGTH) + "_barcode.txt",
+        ref = REFERENCE + ".fa",
+        fai = REFERENCE + ".fa.fai"
+    output:
+        pseudobulk_check = temp(WORKDIR + "/post_mapping/matrices/single_base/{sample}/.done"),
+        matrices = expand(
+            WORKDIR + "/post_mapping/matrices/single_base/{{sample}}/{{sample}}.{type}.matrix10.AllCells.csv",
+            type=["coverage", "mutant", "mutrate"]
+        )
+
+    params:
+        work_path = WORKDIR + "/pileup_results/pileup",
+        output_dir = WORKDIR + "/post_mapping",
+        create_pseudobulk = lambda wc: "True" if "DMSO" in wc.sample else "False",
+        path_to_pseudobulk = WORKDIR + "/post_mapping/pseudobulk/single_base/{sample}.pseudobulk.filtered.byWindows.allCells.csv"
+    
+    singularity: 
+        PYTHON_IMAGE
+    threads: 
+        8
+
+    shell:
+        r"""
+        python3 {MAKE_MATRICES} -t {threads} \
+                                -m single_base \
+                                -w {params.work_path} \
+                                -s {wildcards.sample} \
+                                -r {input.ref} \
+                                -o {params.output_dir} \
+                                -b {input.path_to_barcode}
+
+        if [ "{params.create_pseudobulk}" = "True" ]; then
+            [ -s "{params.path_to_pseudobulk}" ] && touch {output.pseudobulk_check}
+        else
+            touch {output.pseudobulk_check}
+        fi
+        """
+
+rule create_pseudobulk:
+    input:
+        path_to_inputs=lambda wc: get_matrices_specific_condition(
+            condition="DMSO",
+            sample=wc.sample
+        )
+
+    output: 
+        pseudobulk_check = temp(WORKDIR + "/post_mapping/pseudobulk/.{sample}.done"),
+
+    singularity: 
+        PYTHON_IMAGE
+
+    params:
+        path_to_pseudobulk = WORKDIR + "/post_mapping/pseudobulk/single_base/{sample}.pseudobulk.filtered.byWindows.allCells.csv",
+        output_dir = WORKDIR + "/post_mapping"
+
+    shell:
+        r"""
+
+        python3 {CALCULATE_PSEUDOBULK} -w {params.output_dir} \
+                                       -s {wildcards.sample} \
+                                       -m single_base
+
+        if [ ! -s "{params.path_to_pseudobulk}" ]; then
+            echo "Expected pseudobulk file missing or empty: {params.path_to_pseudobulk}" >&2
+            exit 1
+        fi
+
+        touch {output.pseudobulk_check}
+        """
+
+rule plot_basic_statistics:
+    input:
+        path_to_matrices = get_matrices_by_condition
+    
+    output:
+        path_to_plots = directory(WORKDIR + "/post_mapping/plot_count/{condition}")
+    
+    params:
+        output_dir = WORKDIR + "/post_mapping",
+        sample_str = lambda wc: ",".join(get_samples_by_condition(wc.condition))
+    
+    singularity:
+        PYTHON_IMAGE
+    
+    shell:
+        r"""
+        mkdir -p {output.path_to_plots}
+
+        python3 {QC_PLOT_COUNT} -w {params.output_dir} \
+                                -s {params.sample_str} \
+                                -b {wildcards.condition}
+        """
+
+
+def get_normalized_matrices(wc):
+    return expand(
+        WORKDIR + "/post_mapping/normalized_mtx/single_base/{sample}/{sample}.normalized_reactivity.matrix{window}.AllCells.gene_level.csv",
+        sample=SAMPLES,
+        window=WINDOWS
+    )
+
+
+rule sb_gene_level_normalization: 
+    input:
+        path_to_inputs = lambda wc: get_matrices_specific_condition(
+            condition="NAIN3",
+            sample=wc.sample
+        )
+
+    output:
+        matrices = expand(
+            WORKDIR + "/post_mapping/normalized_mtx/single_base/{{sample}}/{{sample}}.normalized_reactivity.matrix{window}.AllCells.gene_level.csv",
+            window=WINDOWS
+        )
+    
+    params:
+        output_dir = WORKDIR + "/post_mapping"
+
+    singularity: 
+        PYTHON_IMAGE
+
+    shell:
+        r"""
+        python3 {NORMALIZATION} -s {wildcards.sample} \
+                                -m single_base \
+                                -w {params.output_dir} \
+                                -c 50,100,200
+        """
+
+
+rule sb_to_fixed_window:
+    input: 
+        path_to_matrices = get_normalized_matrices
+    
+    output: 
+        matrices = expand(
+            WORKDIR + "/post_mapping/single_base_to_fixed_absolute/{{sample}}.{type}.matrix{coverage}.AllCells.csv",
+            type=["coverage", "fixed_single_base"],
+            coverage=["50", "100"]
+        )
+
+    params:
+        output_dir = WORKDIR + "/post_mapping"
+    
+    singularity: 
+        PYTHON_IMAGE
+
+    shell:
+        r"""
+        python3 {MAKE_FIXED_WINDOWS} -s {wildcards.sample} \
+                                     -w {params.output_dir} \
+                                     -c 50,100,200
+
+        """

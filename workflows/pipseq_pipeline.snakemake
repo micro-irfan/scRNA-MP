@@ -1,0 +1,471 @@
+import os
+import glob
+from pathlib import Path
+
+PATH_TO_IMAGE = "/scratch/users/astar/gis/muhdih/image"
+PATH_TO_SCRIPTS = workflow.basedir + "/../mapping"
+WORKDIR = "/scratch/users/astar/gis/muhdih/sgRNA_mutational_rate/cellline"
+FASTQ_DIR = WORKDIR + "/raw_3"
+RESULTS = WORKDIR + "/results_3/preprocessing-test"
+
+# ============================================================================
+# SINGULARITY + SCRIPTS PATH
+# ============================================================================ 
+
+FASTP = PATH_TO_IMAGE + "/fastp:0.23.2--h79da9fb_0"
+BOWTIE2 = PATH_TO_IMAGE + "/bowtie2_samtools_py312.sif"
+FASTQC = PATH_TO_IMAGE + "/fastqc:0.12.1--hdfd78af_0"      
+UMI_TOOLS = PATH_TO_IMAGE + "/umi_tools:1.1.6--py312h0fa9677_0"          
+
+CHECK_BARCODE_SCRIPT = PATH_TO_SCRIPTS + "/pipseq_check_barcode.py"
+R2_WITHCB_SCRIPT = PATH_TO_SCRIPTS + "/read_name_to_sequence.py"
+
+RUN_BOWTIE_SCRIPT = PATH_TO_SCRIPTS + "/run_bowtie2.py"
+ANALYZE_BAM_SCRIPT = PATH_TO_SCRIPTS + "/analyze_bam_reads.py"
+
+ADD_GENETAG_SCRIPT = PATH_TO_SCRIPTS + "/add_genetag.sh"
+EXTRACT_BARCODE_SCRIPT = PATH_TO_SCRIPTS + "/extract_add_barcode.py"
+GET_READS_COUNT = PATH_TO_SCRIPTS + "/count_reads_per_cell_gene.py"
+
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Sample information
+# SAMPLES = ['DM_PIP_DMSO_1in4', 'DM_PIP_NAIN3_1in4', 'DM_PIP_DMSO_3in4', 'DM_PIP_NAIN3_3in4',
+#            'DMS_PIP_DMSO_1in4', 'DMS_PIP_NAIN3_1in4', 'DMS_PIP_DMSO_3in4', 'DMS_PIP_NAIN3_3in4']
+
+SAMPLES = config["sample"].split(',')
+
+# SAMPLES = ['DM_PIP_DMSO_3in4', 'DM_PIP_NAIN3_3in4'] # TESTED
+
+# Reference files
+REFERENCE_WORKDIR = WORKDIR + "/ref"
+REF = REFERENCE_WORKDIR + "/hg38_ncbi_selected_transcriptome.rmdup.fa"
+BOWTIE_INDEX = REFERENCE_WORKDIR + "/hg38_ncbi_selected_transcriptome.rmdup"
+
+
+ADAPTER = {"TSO":"ACGATGGCAGACAGTGACTAAGTACATGGG", "A":"GACGCTGCCGACGA"}
+
+# Bowtie2 parameters
+BOWTIE_PARAMS_STRING = "--sensitive-local --mp 6,2 --rdg 5,3 --rfg 5,3 -k 4"
+
+# Thread count
+THREADS = 8
+
+# Minimum read length for filtering
+FILTER_READ_LENGTH = 40
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+def clean_bowtie_params(params_string):
+    """Convert bowtie parameters to directory-safe format"""
+    import re
+    cleaned = params_string.replace(" ", "_").replace(",", "-").replace("--", "")
+    return cleaned
+
+# Pre-compute the cleaned bowtie parameters string
+BOWTIE_PARAMS_CLEAN = clean_bowtie_params(BOWTIE_PARAMS_STRING)
+
+rule all:
+    input:
+        expand(RESULTS + "/{sample}/fastq/{sample}_R1.fq.gz", sample=SAMPLES),
+        expand(RESULTS + "/{sample}/fastq/{sample}_R2.fq.gz", sample=SAMPLES),
+        expand(RESULTS + "/{sample}/fastqc_raw", sample=SAMPLES),
+        expand(RESULTS + "/{sample}/fastq_readcounts.tsv", sample=SAMPLES),
+        expand(RESULTS + f"/{{sample}}/mapping/bowtie_{BOWTIE_PARAMS_CLEAN}/{{sample}}_addCB_R2.bam", sample=SAMPLES),
+        expand(RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam", sample=SAMPLES),
+        expand(RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_dedup.tsv", sample=SAMPLES),
+        expand(RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_umi.tsv", sample=SAMPLES),
+        expand(RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_fastp.tsv", sample=SAMPLES),
+
+
+# Step 0: Concatenate multiple fastq files if present
+rule concat_fastq:
+    input:
+        r1_files = lambda wildcards: sorted(glob.glob(f"{FASTQ_DIR}/{wildcards.sample}/*_R1*.gz")),
+        r2_files = lambda wildcards: sorted(glob.glob(f"{FASTQ_DIR}/{wildcards.sample}/*_R2*.gz"))
+    output:
+        r1 = RESULTS + "/{sample}/fastq/{sample}_R1.fq.gz",
+        r2 = RESULTS + "/{sample}/fastq/{sample}_R2.fq.gz"
+    params:
+        folder = RESULTS + "/{sample}/fastq"
+    shell:
+        """
+        mkdir -p {params.folder}
+        cat {input.r1_files} > {output.r1}
+        cat {input.r2_files} > {output.r2}
+        """
+
+
+# Step 1: FastQC on raw reads
+rule raw_fastqc:
+    input:
+        r1 = RESULTS + "/{sample}/fastq/{sample}_R1.fq.gz",
+        r2 = RESULTS + "/{sample}/fastq/{sample}_R2.fq.gz"
+    output:
+        fastqc_dir = directory(RESULTS + "/{sample}/fastqc_raw")
+    
+    singularity: FASTQC
+    threads: THREADS
+
+    shell:
+        """
+        mkdir -p {output.fastqc_dir}
+        fastqc {input.r1} {input.r2} -o {output.fastqc_dir} -t {THREADS}
+        """
+
+
+# Step 2: Identifying the UMI and cell barcode whitelist
+rule umi_tools_whitelist:
+    input:
+        r1 = rules.raw_fastqc.input.r1
+    output:
+        whitelist = RESULTS + "/{sample}/umi_tools/{sample}_whitelist.txt",
+        checked_whitelist = RESULTS + "/{sample}/umi_tools/{sample}_checked_whitelist.txt",
+        log = RESULTS + "/{sample}/umi_tools/umi_tools.log"
+    params:
+        folder = RESULTS + "/{sample}/umi_tools",
+        prefix = RESULTS + "/{sample}/umi_tools/knee_plot"
+    priority: 50
+    singularity: UMI_TOOLS
+
+    shell:
+        """
+        mkdir -p {params.folder}
+
+        umi_tools whitelist \
+        --extract-method=regex \
+        --bc-pattern='^(?:.{{0,3}})(?P<cell_1>.{{8}})(?P<discard_1>ATG)(?P<cell_2>.{{6}})(?P<discard_2>GAG)(?P<cell_3>.{{6}})(?P<discard_3>TCGAG)(?P<cell_4>.{{8}})(?P<umi_1>.{{3}})' \
+        --plot-prefix={params.prefix} \
+        -I {input.r1} \
+        -L {output.log} \
+        -S {output.whitelist}
+
+        cut -f1 {output.whitelist} > {params.folder}/{wildcards.sample}_temp.txt
+
+        python {CHECK_BARCODE_SCRIPT} {params.folder}/{wildcards.sample}_temp.txt -o {output.checked_whitelist}
+
+        rm {params.folder}/{wildcards.sample}_temp.txt
+        """
+
+
+# Step 3: Extract the barcodes and filter the reads
+rule umi_tools_extract:
+    input:
+        r1 = rules.raw_fastqc.input.r1,
+        r2 = rules.raw_fastqc.input.r2,
+        whitelist = RESULTS + "/{sample}/umi_tools/{sample}_checked_whitelist.txt"
+    output:
+        r1_CB = temp(RESULTS + "/{sample}/umi_tools/{sample}_addCB_R1.fq.gz"),
+        r2_CB = temp(RESULTS + "/{sample}/umi_tools/{sample}_addCB_R2.fq.gz"),
+        unmatched_r1 = temp(RESULTS + "/{sample}/unmatched_R1.fastq.gz"),
+        unmatched_r2 = temp(RESULTS + "/{sample}/unmatched_R2.fastq.gz")
+    priority: 50
+    singularity: UMI_TOOLS
+    
+    shell:
+        """
+        umi_tools extract \
+        --extract-method=regex \
+        --bc-pattern='^(?:.{{0,3}})(?P<cell_1>.{{8}})(?P<discard_1>ATG)(?P<cell_2>.{{6}})(?P<discard_2>GAG)(?P<cell_3>.{{6}})(?P<discard_3>TCGAG)(?P<cell_4>.{{8}})(?P<umi_1>.{{3}})' \
+        --stdin {input.r1} \
+        --stdout {output.r1_CB} \
+        --read2-in {input.r2} \
+        --read2-out {output.r2_CB} \
+        --filtered-out {output.unmatched_r1} \
+        --filtered-out2 {output.unmatched_r2} \
+        --whitelist={input.whitelist}
+        """
+
+
+# Step 4a: Add UMI and barcode to R2 for fastp
+rule add_umibarcode:
+    input:
+        fastq = RESULTS + "/{sample}/umi_tools/{sample}_addCB_R2.fq.gz"
+    output:
+        fastq = temp(RESULTS + "/{sample}/umi_tools/{sample}_withCB_R2.fq.gz")
+    
+    singularity: BOWTIE2
+    shell:
+        """
+        python3 {R2_WITHCB_SCRIPT} {input.fastq} {output.fastq}
+        """
+
+
+# Step 4b: Deduplication with fastp
+# Optimization: added --thread for multi-threaded processing
+rule fastp_dedup:
+    input:
+        fastq = RESULTS + "/{sample}/umi_tools/{sample}_withCB_R2.fq.gz"
+    output:
+        fastq = temp(RESULTS + "/{sample}/umi_tools/{sample}_R2_fastp.fq.gz")
+    
+    params:
+        prefix = RESULTS + "/{sample}/umi_tools/{sample}_fastp"
+
+    threads: THREADS
+    singularity: FASTP
+
+    shell:
+        """
+        fastp -i {input.fastq} \
+              -o {output.fastq} \
+              --dedup \
+              --thread {threads} \
+              -j {params.prefix}.json \
+              -h {params.prefix}.html
+        """
+
+
+# Step 4c: Record FASTQ read counts before temp files are deleted
+rule count_fastq_reads:
+    input:
+        r1_CB = RESULTS + "/{sample}/umi_tools/{sample}_addCB_R1.fq.gz",
+        r2_CB = RESULTS + "/{sample}/umi_tools/{sample}_addCB_R2.fq.gz",
+        unmatched_r1 = RESULTS + "/{sample}/unmatched_R1.fastq.gz",
+        unmatched_r2 = RESULTS + "/{sample}/unmatched_R2.fastq.gz",
+        r2_withCB = RESULTS + "/{sample}/umi_tools/{sample}_withCB_R2.fq.gz",
+        r2_fastp = RESULTS + "/{sample}/umi_tools/{sample}_R2_fastp.fq.gz"
+    output:
+        stats = RESULTS + "/{sample}/fastq_readcounts.tsv"
+    threads: THREADS
+    singularity: BOWTIE2
+    
+    shell:
+        """
+        echo -e "file\\treads" > {output.stats}
+        for fq in {input.r1_CB} {input.r2_CB} {input.unmatched_r1} {input.unmatched_r2} {input.r2_withCB} {input.r2_fastp}; do
+            reads=$(pigz -dc "$fq" | wc -l)
+            echo -e "$(basename $fq)\\t$((reads / 4))" >> {output.stats}
+        done
+        """
+
+# Step 5a: Map raw reads to whole transcriptome reference
+rule map_transcriptome_raw:
+    input:
+        fastq = RESULTS + "/{sample}/umi_tools/{sample}_addCB_R2.fq.gz"
+    output:
+        bam = RESULTS + f"/{{sample}}/mapping/bowtie_{BOWTIE_PARAMS_CLEAN}/{{sample}}_addCB_R2.bam"
+    params:
+        bowtie_params = BOWTIE_PARAMS_STRING,
+        bowtie_folder = directory(RESULTS + "/{sample}/mapping/")
+    
+    threads: THREADS
+    singularity: BOWTIE2
+
+    shell:
+        """
+        python3 {RUN_BOWTIE_SCRIPT} --reference_index {BOWTIE_INDEX} \
+                                    --input_fastq {input.fastq} \
+                                    --base_output_dir {params.bowtie_folder} \
+                                    --bowtie_params "{params.bowtie_params}" \
+                                    --threads {threads}
+        """
+
+
+# Step 5b: Map fastp-deduped reads to whole transcriptome reference
+rule map_transcriptome_fastp:
+    input:
+        fastq = RESULTS + "/{sample}/umi_tools/{sample}_R2_fastp.fq.gz"
+    output:
+        bam = RESULTS + f"/{{sample}}/mapping/bowtie_{BOWTIE_PARAMS_CLEAN}/{{sample}}_R2_fastp.bam"
+    params:
+        bowtie_params = BOWTIE_PARAMS_STRING,
+        bowtie_folder = directory(RESULTS + "/{sample}/mapping/")
+    threads: THREADS
+    singularity: BOWTIE2
+    shell:
+        """
+        python3 {RUN_BOWTIE_SCRIPT} --reference_index {BOWTIE_INDEX} \
+                                    --input_fastq {input.fastq} \
+                                    --base_output_dir {params.bowtie_folder} \
+                                    --bowtie_params "{params.bowtie_params}" \
+                                    --threads {threads}
+        """
+
+# Step 6a: Filter raw reads by length (>40bp)
+rule filter_bam_raw:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/bowtie_{BOWTIE_PARAMS_CLEAN}/{{sample}}_addCB_R2.bam"
+    output:
+        bam_out = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}.bam"),
+        bam_sorted_out = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}.sorted.bam"),
+        bam_sorted_bai = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}.sorted.bam.bai"),
+        temp_read_sorted_bam = temp(RESULTS + "/{sample}/mapping/{sample}_temp_sorted.bam")
+    params:
+        prefix = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}",
+        min_len = FILTER_READ_LENGTH
+    
+    threads: THREADS
+    singularity: BOWTIE2
+    
+    shell:
+        """
+        samtools sort -n -@ {threads} {input.bam} -o {output.temp_read_sorted_bam}
+        python3 {ANALYZE_BAM_SCRIPT} {output.temp_read_sorted_bam} -o {params.prefix} -m {params.min_len} --extract-unique
+        samtools sort -@ {threads} {output.bam_out} -o {output.bam_sorted_out}
+        samtools index -@ {threads} {output.bam_sorted_out}
+        """
+
+# Step 6b: Filter fastp reads by length (>40bp)
+rule filter_bam_fastp:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/bowtie_{BOWTIE_PARAMS_CLEAN}/{{sample}}_R2_fastp.bam"
+    output:
+        bam_out = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}.bam"),
+        bam_sorted_out = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}.sorted.bam"),
+        bam_sorted_bai = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}.sorted.bam.bai"),
+        temp_read_sorted_bam = temp(RESULTS + "/{sample}/mapping/{sample}_fastp_temp_sorted.bam")
+    params:
+        prefix = RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}",
+        min_len = FILTER_READ_LENGTH
+    
+    threads: THREADS
+    singularity: BOWTIE2
+    
+    shell:
+        """
+        samtools sort -n -@ {threads} {input.bam} -o {output.temp_read_sorted_bam}
+        python3 {ANALYZE_BAM_SCRIPT} {output.temp_read_sorted_bam} -o {params.prefix} -m {params.min_len} --extract-unique
+        samtools sort -@ {threads} {output.bam_out} -o {output.bam_sorted_out}
+        samtools index -@ {threads} {output.bam_sorted_out}
+        """
+
+# Step 7a: Add CB, UMI, and gene tags to raw BAM
+rule add_tags_raw:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}.sorted.bam",
+        bai = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}.sorted.bam.bai"
+    output:
+        add_gene = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_genetag.bam"),
+        add_all = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_addAlltag.bam"
+    threads: THREADS
+    singularity: BOWTIE2
+    shell:
+        """
+        bash {ADD_GENETAG_SCRIPT} {input.bam} {output.add_gene}
+        python3 {EXTRACT_BARCODE_SCRIPT} add_tags {output.add_gene} {output.add_all}
+        samtools index -@ {threads} {output.add_all}
+        """
+
+# Step 7b: Add CB, UMI, and gene tags to fastp BAM
+rule add_tags_fastp:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}.sorted.bam",
+        bai = RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}.sorted.bam.bai"
+    output:
+        add_gene = temp(RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}_genetag.bam"),
+        add_all = RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}_addAlltag.bam",
+        barcode = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_barcode.txt"
+    
+    threads: THREADS
+    singularity: BOWTIE2
+    
+    shell:
+        """
+        bash {ADD_GENETAG_SCRIPT} {input.bam} {output.add_gene}
+        python3 {EXTRACT_BARCODE_SCRIPT} add_tags {output.add_gene} {output.add_all}
+        samtools index -@ {threads} {output.add_all}
+        python3 {EXTRACT_BARCODE_SCRIPT} extract_barcodes {output.add_all} {output.barcode} --unique
+        """
+
+
+# Step 8: Deduplicate using umi_tools
+rule umi_tools_dedup:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_addAlltag.bam"
+    output:
+        dedup = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam"
+    params:
+        prefix = RESULTS + "/{sample}/mapping/dedup"
+
+    singularity: UMI_TOOLS
+    shell:
+        """
+        umi_tools dedup --stdin={input.bam} \
+                        --stdout={output.dedup} \
+                        --output-stats={params.prefix} \
+                        --extract-umi-method=tag \
+                        --umi-tag=UM \
+                        --cell-tag=CB \
+                        --per-cell
+        """
+
+# Step 8a: Samtools Index
+rule samtools_index:
+    input:
+        dedup = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam"
+    output: 
+        dedup_bai = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam.bai"
+
+    threads: THREADS
+    singularity: BOWTIE2
+
+    shell:
+        """
+        samtools index -@ {threads} {input.dedup}
+        """
+
+# Step 9a: Calculate dedup read count per cell per gene
+rule read_count_dedup:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam"
+    output:
+        exp = RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_dedup.tsv"
+    params:
+        folder = RESULTS + f"/{{sample}}/expression/"
+    
+    singularity: BOWTIE2
+    shell:
+        """
+        mkdir -p {params.folder}
+        python3 {GET_READS_COUNT} -i {input.bam} -o {output.exp}
+        """
+
+# Step 9b: Calculate fastp read count per cell per gene
+rule read_count_fastp:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_fastp_filter{FILTER_READ_LENGTH}_addAlltag.bam"
+    output:
+        exp = RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_fastp.tsv"
+    params:
+        folder = RESULTS + f"/{{sample}}/expression/"
+    
+    singularity: BOWTIE2
+    shell:
+        """
+        mkdir -p {params.folder}
+
+        python3 {GET_READS_COUNT} -i {input.bam} -o {output.exp}
+        """
+
+# Step 9c: Calculate UMI count using umi_tools
+rule umi_count:
+    input:
+        bam = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam",
+        bai = RESULTS + f"/{{sample}}/mapping/{{sample}}_filter{FILTER_READ_LENGTH}_dedup.bam.bai"
+    output:
+        exp_umi = RESULTS + f"/{{sample}}/expression/{{sample}}_filter{FILTER_READ_LENGTH}_exp_umi.tsv"
+    params:
+        folder = RESULTS + f"/{{sample}}/expression/"
+    
+    threads: THREADS
+    singularity: UMI_TOOLS
+    shell:
+        """
+        mkdir -p {params.folder}
+
+        umi_tools count --per-gene \
+                        --gene-tag=XT \
+                        --extract-umi-method=tag \
+                        --umi-tag=UM \
+                        --cell-tag=CB \
+                        --per-cell \
+                        --wide-format-cell-counts \
+                        -I {input.bam} \
+                        -S {output.exp_umi}
+        """
