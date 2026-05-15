@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from sklearn import metrics
 from typing import List, Optional
-import plot as plot
+import plot_auroc as plot
 from pathlib import Path
 from itertools import combinations
 import warnings

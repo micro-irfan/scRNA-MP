@@ -36,6 +36,7 @@
 *.sam
 
 /run/
+/archived/ 
 
 TODO.md
 
