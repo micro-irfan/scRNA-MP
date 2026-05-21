@@ -6,3 +6,7 @@
 - [src](src/README.md): core matrix/QC/normalization/clustering scripts.
 - [support](support/README.md): downstream AUROC analysis and plotting helpers.
 - [workflows](workflows/README.md): Snakemake/Nextflow pipeline entrypoints and configs.
+
+## License
+This project is licensed under the GNU General Public License v3.0.  
+See [LICENSE](LICENSE) for the full text.

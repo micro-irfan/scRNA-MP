@@ -13,7 +13,8 @@ def file_exists(path):
     return Path(path).exists()
 
 
-template = "{treatment}_{}_{}_{volume}" 
+template = "{treatment}_{}_{}_{volume}"
+alt_template = "{}_{treatment}_{}_{}"
 
 
 def generate_path(args, sample_id):
@@ -52,8 +53,13 @@ def check_arguments(args):
             if file_exists(file): continue
             return True, f"{file} does not exist..."
     
-    if 'treatment' not in args.template:
-        return True, f"Keyword treatment is missing in the template! Example: {template}"
+    mapping = utils.parse_template(args.template)
+    if 'treatment' not in mapping:
+        return (
+            True,
+            "Keyword {treatment} is missing in --template. "
+            f"Examples: {template} or {alt_template}"
+        )
 
     return False, None
         
@@ -85,9 +91,47 @@ def threshold_and_drop_all_nan_rows(path, X):
     return df
 
 
-def open_cluster_file(sample_id, work_path):
-    bam_location = f"{work_path}/preprocessing/{sample_id}/mapping"
-    barcode_file = f"{bam_location}/{sample_id}_filter40_barcode.txt"
+def _resolve_barcode_file(sample_id, work_path, barcode_root=None):
+    sample = str(sample_id)
+    candidates = []
+
+    if barcode_root:
+        root = Path(barcode_root)
+        candidates.extend(
+            [
+                root / sample / "mapping" / f"{sample}_filter40_barcode.txt",
+                root / sample / f"{sample}_filter40_barcode.txt",
+                root / f"{sample}_filter40_barcode.txt",
+            ]
+        )
+
+    # Backward-compatible default location
+    candidates.append(
+        Path(work_path) / "preprocessing" / sample / "mapping" / f"{sample}_filter40_barcode.txt"
+    )
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    # Last-resort recursive search under barcode_root, if provided
+    if barcode_root:
+        hits = sorted(Path(barcode_root).glob(f"**/{sample}_filter40_barcode.txt"))
+        if hits:
+            return hits[0]
+
+    raise FileNotFoundError(
+        f"Could not resolve barcode file for sample '{sample}'. "
+        f"Tried default under work_path and barcode_root={barcode_root!r}."
+    )
+
+
+def open_cluster_file(sample_id, work_path, barcode_root=None):
+    barcode_file = _resolve_barcode_file(
+        sample_id=sample_id,
+        work_path=work_path,
+        barcode_root=barcode_root,
+    )
 
     barcode_dict = {}
     with open(barcode_file, 'r') as f:
@@ -122,7 +166,11 @@ class OpenMatrices:
             coverage_df[sample_id] = utils.add_source_prefix(c_df, sample_id)
             reactivity_df[sample_id] = utils.add_source_prefix(r_df, sample_id)
 
-            barcode_dict = open_cluster_file(sample_id, args.work_path) 
+            barcode_dict = open_cluster_file(
+                sample_id,
+                args.work_path,
+                barcode_root=args.barcode_root,
+            )
             sep = ',' if args.use_bam else '\t'
             tmp_df = utils.open_matrices(rc_file, sep=sep)
             tmp_df = tmp_df.rename(columns=barcode_dict)
@@ -175,9 +223,19 @@ def get_args():
 
     parser.add_argument('-w', '--work_path', required = True, type=str, default='',
                         help='Path to store output')   
+
+    parser.add_argument('--barcode-root', required=False, type=str, default=None,
+                        help=(
+                            "Optional root directory for sample barcode files. "
+                            "Expected patterns include "
+                            "<root>/<sample>/mapping/<sample>_filter40_barcode.txt."
+                        ))
     
     parser.add_argument('--template', required = False, type=str, default=template,
-                        help=f'Treatment is required! Example of a template: {template}')  
+                        help=(
+                            "Template used to parse sample IDs; must include {treatment}. "
+                            f"Examples: {template} or {alt_template}"
+                        ))  
     
     parser.add_argument('--use_bam', action="store_true",
 						help="Use Bam Matrix instead of UMI")
