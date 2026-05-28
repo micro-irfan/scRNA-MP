@@ -2,6 +2,7 @@
 
 ## Directory guides
 - [crop-seq](crop-seq/README.md): CROP-seq guide assignment and QC utilities.
+- [gene_preprocessing](gene_preprocessing/README.md): Scanpy and SCTransform gene-expression preprocessing workflows.
 - [multiomics](multiomics/README.md): splicing and MOFA2 multi-omics analysis workflows.
 - [src](src/README.md): core matrix/QC/normalization/clustering scripts.
 - [support](support/README.md): downstream AUROC analysis and plotting helpers.

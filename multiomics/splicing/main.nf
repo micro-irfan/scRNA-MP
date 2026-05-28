@@ -73,7 +73,6 @@ process addReadGroup {
 }
 
 params.workDir = "/home/users/astar/gis/muhdih/scratch/sgRNA_mutational_rate/cellline"
-params.reference = "${params.workDir}/ref/hg38_ncbi_selected_transcriptome.rmdup"
 params.directory = "${params.workDir}/data_3"
 
 // Create channel for input reads 
